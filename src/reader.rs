@@ -7,6 +7,7 @@ use xml::common::Position;
 
 use osm_primitives::*;
 
+// TODO proper error handling with our custom Error type
 fn metadata<'a, T>(attributes: T) -> Result<ElementMetadata, std::option::NoneError> where T: Iterator<Item = &'a OwnedAttribute> {
   let mut id: Option<i64> = None;
   let mut user: Option<String> = None;
@@ -110,11 +111,11 @@ fn ensure_element_closure<T: Iterator<Item = xml::reader::Result<XmlEvent>>, A: 
       Ok(XmlEvent::EndElement { .. })             => { break; }
       Ok(XmlEvent::Comment { .. })                => {} // Ignore
       Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
+      Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
 
       // Don't think this is possible, considering it should throw an EOF error from the parser.
       Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
 
-      Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
       Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(position.position())));       }
       Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       ErrorPosition::Rough(position.position())));       }
       Ok(XmlEvent::StartElement { name, .. })     => { return Err(Error::UnexpectedElement { position: ErrorPosition::Rough(position.position()), expected: None, got: name.local_name });       }
@@ -129,10 +130,12 @@ pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
 
   let mut parser = event_reader.into_iter().peekable();
 
-  /// Returns Ok(None) if the end has been reached. Calling it again and again after the end has been reached may or may not wrap around.
+  /// Returns Ok(None) if the end has been reached.
+  /// Calling it again and again after the end has been reached may or may not wrap around, as per stdlib Iterator documentation.
   fn next<T: Iterator<Item = xml::reader::Result<XmlEvent>>, A: Position>(parser: &mut Peekable<T>, position: &A) -> Result<Option<Element>, Error> {
     let next = parser.next();
     if next.is_none() { return Ok(None); } // Last element has already been served, we are now at the end.
+    // TODO handle closing osm element
 
     match next.unwrap() {
       Ok(XmlEvent::StartElement { name, attributes, .. }) => {
@@ -157,7 +160,6 @@ pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
 
             if let None = lat { return Err(Error::MissingAttribute(ErrorPosition::Rough(position.position()), "lat")); }
             if let None = lon { return Err(Error::MissingAttribute(ErrorPosition::Rough(position.position()), "lon")); }
-            // TODO missing lon
 
             ensure_element_closure(parser, position)?;
             return Ok(Some(Element::Node(
@@ -171,11 +173,10 @@ pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
           }
 
           "way" => {
-            let meta = metadata(attributes.iter()).unwrap();
 
             let mut way = Way {
+              metadata: metadata(attributes.iter()).unwrap(),
               tags: Vec::new(),
-              metadata: meta,
               nodes: Vec::new()
             };
 
