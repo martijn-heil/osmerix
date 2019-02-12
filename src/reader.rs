@@ -41,7 +41,8 @@ fn metadata<'a, T>(attributes: T) -> Result<ElementMetadata, std::option::NoneEr
 }
 
 pub struct DocumentMetadata {
-
+  version: Option<String>,
+  generator: Option<String>,
 }
 
 /// Type definition may change over time, but unless a breaking change is made the struct is always
@@ -67,11 +68,17 @@ pub enum Error {
   MissingRelationMemberType(ErrorPosition),
   MissingRelationMemberRole(ErrorPosition),
   MissingRelationMemberRef(ErrorPosition),
-  UnexpectedElement { position: ErrorPosition, expected: Option<Vec<String>>, got: String }
+  MissingAttribute(ErrorPosition, &'static str),
+  UnexpectedElement { position: ErrorPosition, expected: Option<Vec<String>>, got: String },
+  ParserError(ErrorPosition, xml::reader::Error),
+  UnexpectedCData(ErrorPosition),
+  UnexpectedCharacters(ErrorPosition),
 }
 
 struct ReaderIterator<T: Read>(EventReader<T>);
 
+/// Non-validating [OSM XML](https://wiki.openstreetmap.org/wiki/OSM_XML) parser.
+///
 /// You can be certain that all elements will be served in the following order, as guaranteed by the OSM XML format:
 /// 1. All nodes
 /// 2. All ways
@@ -95,18 +102,23 @@ impl<T: Read> Reader<T> {
 //  fn elements()
 }
 
-fn ensure_element_closure<T: Iterator<Item = xml::reader::Result<XmlEvent>>, A: &Position>(parser: &mut Peekable<T>, position: A) -> Result<Option<Element>, Error> {
+/// Advances an iterator until a XmlEvent::EndElement is consumed, skipping any whitespace, comments and ProcessingInstruction's.
+/// It returns an error if any other kind of XmlEvent is encountered.
+fn ensure_element_closure<T: Iterator<Item = xml::reader::Result<XmlEvent>>, A: Position>(parser: &mut Peekable<T>, position: &A) -> Result<Option<Element>, Error> {
   loop { // loop until either unexpected thing or closing tag is encountered.
     match parser.next().unwrap() {
       Ok(XmlEvent::EndElement { .. })             => { break; }
       Ok(XmlEvent::Comment { .. })                => {} // Ignore
       Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
-      Ok(XmlEvent::EndDocument { .. })            => { panic!(); } // Don't think this is possible, considering it should throw an EOF error from the parser.
+
+      // Don't think this is possible, considering it should throw an EOF error from the parser.
+      Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
+
       Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
-      Ok(XmlEvent::Characters { .. })             => { return Error::UnexpectedCharacters(  ErrorPosition::Rough(position.position()));       }
-      Ok(XmlEvent::CData { .. })                  => { return Error::UnexpectedCData(       ErrorPosition::Rough(position.position()));       }
-      Ok(XmlEvent::StartElement { .. })           => { return Error::UnexpectedStartElement(ErrorPosition::Rough(position.position()));       }
-      Err(Xml::reader::Error(err))                => { return Error::ParserError(           ErrorPosition::Rough(position.position()), err);  }
+      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(position.position())));       }
+      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       ErrorPosition::Rough(position.position())));       }
+      Ok(XmlEvent::StartElement { name, .. })     => { return Err(Error::UnexpectedElement { position: ErrorPosition::Rough(position.position()), expected: None, got: name.local_name });       }
+      Err(err)                                    => { return Err(Error::ParserError(           ErrorPosition::Rough(position.position()), err));  }
     }
   }
 }
@@ -116,9 +128,12 @@ pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
   let event_reader = EventReader::new(r);
 
   let mut parser = event_reader.into_iter().peekable();
-  fn next<T: Iterator<Item = xml::reader::Result<XmlEvent>>, A: &Position>(parser: &mut Peekable<T>, position: A) -> Result<Option<Element>, Error> {
+
+  /// Returns Ok(None) if the end has been reached. Calling it again and again after the end has been reached may or may not wrap around.
+  fn next<T: Iterator<Item = xml::reader::Result<XmlEvent>>, A: Position>(parser: &mut Peekable<T>, position: &A) -> Result<Option<Element>, Error> {
     let next = parser.next();
-    if next.is_none() { return Ok(None); }
+    if next.is_none() { return Ok(None); } // Last element has already been served, we are now at the end.
+
     match next.unwrap() {
       Ok(XmlEvent::StartElement { name, attributes, .. }) => {
         match name.local_name.as_str() {
@@ -140,6 +155,11 @@ pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
               }
             }
 
+            if let None = lat { return Err(Error::MissingAttribute(ErrorPosition::Rough(position.position()), "lat")); }
+            if let None = lon { return Err(Error::MissingAttribute(ErrorPosition::Rough(position.position()), "lon")); }
+            // TODO missing lon
+
+            ensure_element_closure(parser, position)?;
             return Ok(Some(Element::Node(
               Node {
                 lat: lat.unwrap(),
@@ -193,7 +213,7 @@ pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
                       way.tags.push(Tag { key: key.unwrap(), value: value.unwrap() });
 
                       // Make sure to read EndElement for <tag />
-                      ensure_element_closure()?;
+                      ensure_element_closure(parser, position)?;
 
                     }
                     _ => { panic!(); /* TODO error */ }
@@ -245,7 +265,7 @@ pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
                         "node"      => ReferencedElement::Node(ref_id),
                         "way"       => ReferencedElement::Way(ref_id),
                         "relation"  => ReferencedElement::Relation(ref_id),
-                        _ => { panic!(); /* TODO error */ }
+                        _ => { return Err(Error::InvalidRelationMemberType(ErrorPosition::Rough(position.position()), _)); }
                       };
 
                       relation.members.push(RelationMember {
@@ -254,7 +274,7 @@ pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
                       });
 
                       // Make sure to close <member /> off
-                      ensure_element_closure();
+                      ensure_element_closure(parser, position);
                     }
 
                     "tag" => {
@@ -269,7 +289,7 @@ pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
                       }
                       relation.tags.push(Tag { key: key.unwrap(), value: value.unwrap() });
                       // Make sure to close <way /> off
-                      ensure_element_closure();
+                      ensure_element_closure(parser, position);
                     }
 
                     &_ => {
@@ -294,4 +314,3 @@ pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
   }
 }
 
-//fn osm_write<T: Write>(w: T) -> Result<_, &str>
