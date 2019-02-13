@@ -1,5 +1,4 @@
 use std::io::prelude::*;
-use std::iter::Peekable;
 
 use xml::reader::{EventReader, XmlEvent};
 use xml::attribute::OwnedAttribute;
@@ -74,6 +73,7 @@ pub enum Error {
   ParserError(ErrorPosition, xml::reader::Error),
   UnexpectedCData(ErrorPosition),
   UnexpectedCharacters(ErrorPosition),
+  InvalidRelationMemberType(ErrorPosition, String)
 }
 
 struct ReaderIterator<T: Read>(EventReader<T>);
@@ -99,40 +99,12 @@ impl<T: Read> Reader<T> {
   fn metadata(&mut self) -> DocumentMetadata {
 
   }
-
-//  fn elements()
 }
 
-/// Advances an iterator until a XmlEvent::EndElement is consumed, skipping any whitespace, comments and ProcessingInstruction's.
-/// It returns an error if any other kind of XmlEvent is encountered.
-fn ensure_element_closure<T: Iterator<Item = xml::reader::Result<XmlEvent>>, A: Position>(parser: &mut Peekable<T>, position: &A) -> Result<Option<Element>, Error> {
-  loop { // loop until either unexpected thing or closing tag is encountered.
-    match parser.next().unwrap() {
-      Ok(XmlEvent::EndElement { .. })             => { break; }
-      Ok(XmlEvent::Comment { .. })                => {} // Ignore
-      Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
-      Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
+impl<T: Read> Iterator<Item = Result<Element, Error>> for Reader<T> {
+  fn next(&mut self) -> Option<Self::Item> {
+    let parser = &mut self.parser;
 
-      // Don't think this is possible, considering it should throw an EOF error from the parser.
-      Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
-
-      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(position.position())));       }
-      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       ErrorPosition::Rough(position.position())));       }
-      Ok(XmlEvent::StartElement { name, .. })     => { return Err(Error::UnexpectedElement { position: ErrorPosition::Rough(position.position()), expected: None, got: name.local_name });       }
-      Err(err)                                    => { return Err(Error::ParserError(           ErrorPosition::Rough(position.position()), err));  }
-    }
-  }
-}
-
-
-pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
-  let event_reader = EventReader::new(r);
-
-  let mut parser = event_reader.into_iter().peekable();
-
-  /// Returns Ok(None) if the end has been reached.
-  /// Calling it again and again after the end has been reached may or may not wrap around, as per stdlib Iterator documentation.
-  fn next<T: Iterator<Item = xml::reader::Result<XmlEvent>>, A: Position>(parser: &mut Peekable<T>, position: &A) -> Result<Option<Element>, Error> {
     let next = parser.next();
     if next.is_none() { return Ok(None); } // Last element has already been served, we are now at the end.
     // TODO handle closing osm element
@@ -140,171 +112,9 @@ pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
     match next.unwrap() {
       Ok(XmlEvent::StartElement { name, attributes, .. }) => {
         match name.local_name.as_str() {
-          "node" => {
-            let meta = metadata(attributes.iter()).unwrap();
-
-            let mut lat: Option<f64> = None;
-            let mut lon: Option<f64> = None;
-
-
-            for attr in attributes.iter() {
-              let name = &(attr.name.local_name);
-              let value = &attr.value;
-
-              match name.as_str() {
-                "lat"       => { lat = Some(value.parse::<f64>().unwrap()); }
-                "lon"       => { lon = Some(value.parse::<f64>().unwrap()); }
-                _ => {}
-              }
-            }
-
-            if let None = lat { return Err(Error::MissingAttribute(ErrorPosition::Rough(position.position()), "lat")); }
-            if let None = lon { return Err(Error::MissingAttribute(ErrorPosition::Rough(position.position()), "lon")); }
-
-            ensure_element_closure(parser, position)?;
-            return Ok(Some(Element::Node(
-              Node {
-                lat: lat.unwrap(),
-                lon: lon.unwrap(),
-                tags: Vec::new(),
-                metadata: meta,
-              }
-            )));
-          }
-
-          "way" => {
-
-            let mut way = Way {
-              metadata: metadata(attributes.iter()).unwrap(),
-              tags: Vec::new(),
-              nodes: Vec::new()
-            };
-
-            // Read all node references and tags
-            loop {
-              match parser.next().unwrap() { // Can't have an empty way anyway..
-                Ok(XmlEvent::StartElement { name, attributes, .. }) => {
-                  match name.local_name.as_str() {
-                    "nd" => {
-                      way.nodes.push(
-                        ReferencedNode {
-                          id: attributes.iter()
-                          .find(|attr| attr.name.local_name == "ref").unwrap()
-                          .value.parse::<i64>().unwrap()
-                        }
-                      );
-
-                      // Make sure to read EndElement for <nd ref=".." />
-                      match parser.next().unwrap() {
-                        Ok(XmlEvent::EndElement { .. }) => {}
-                        _ => { panic!(); /* TODO error */ }
-                      }
-                    }
-
-                    "tag" => {
-                      let mut key: Option<String> = None;
-                      let mut value: Option<String> = None;
-                      for attr in attributes { // TODO optimize
-                        match attr.name.local_name.as_str() {
-                          "k" => { key = Some(attr.value); }
-                          "v" => { value = Some(attr.value); }
-                          _ => {} // Can be safely ignored
-                        }
-                      }
-                      way.tags.push(Tag { key: key.unwrap(), value: value.unwrap() });
-
-                      // Make sure to read EndElement for <tag />
-                      ensure_element_closure(parser, position)?;
-
-                    }
-                    _ => { panic!(); /* TODO error */ }
-                  }
-                }
-
-                Ok(XmlEvent::EndElement { .. }) => {
-                  break; // Encountered </way>, exit from node & tag reading loop
-                }
-
-                _ => {/* TODO */ }
-              }
-            }
-
-            return Ok(Some(Element::Way(way)));
-          }
-
-          "relation" => {
-            let mut relation = Relation {
-              metadata: metadata(attributes.iter()).unwrap(),
-              members: Vec::new(),
-              tags: Vec::new(),
-            };
-
-            loop {
-              if let Ok(XmlEvent::EndElement { .. }) = parser.peek().unwrap() { break; }
-              match parser.next().unwrap() {
-                Ok(XmlEvent::StartElement { name, attributes, .. }) => {
-                  match name.local_name.as_str() {
-                    "member" => {
-                      let mut kind_maybe: Option<String> = None;
-                      let mut ref_id_maybe: Option<i64> = None;
-                      let mut role_maybe: Option<String> = None;
-
-                      for attr in attributes.into_iter() {
-                        match attr.name.local_name.as_str() {
-                          "type" => { kind_maybe = Some(attr.value); }
-                          "ref" => { ref_id_maybe = Some(attr.value.parse::<i64>().unwrap()); }
-                          "role" => { role_maybe = Some(attr.value); }
-                          _ => {}
-                        }
-                      }
-
-                      let kind    = if let Some(kind)   = kind_maybe    { kind }    else { return Err(Error::MissingRelationMemberType(ErrorPosition::Rough(position.position()))); };
-                      let ref_id  = if let Some(ref_id) = ref_id_maybe  { ref_id }  else { return Err(Error::MissingRelationMemberRef(ErrorPosition::Rough(position.position()))); };
-                      let role    = if let Some(role)   = role_maybe    { role }    else { return Err(Error::MissingRelationMemberRole(ErrorPosition::Rough(position.position()))); };
-
-                      let element = match kind.as_str() {
-                        "node"      => ReferencedElement::Node(ref_id),
-                        "way"       => ReferencedElement::Way(ref_id),
-                        "relation"  => ReferencedElement::Relation(ref_id),
-                        _ => { return Err(Error::InvalidRelationMemberType(ErrorPosition::Rough(position.position()), _)); }
-                      };
-
-                      relation.members.push(RelationMember {
-                        role: role,
-                        element: element,
-                      });
-
-                      // Make sure to close <member /> off
-                      ensure_element_closure(parser, position);
-                    }
-
-                    "tag" => {
-                      let mut key: Option<String> = None;
-                      let mut value: Option<String> = None;
-                      for attr in attributes.into_iter() {
-                        match attr.name.local_name.as_str() {
-                          "k" => { key = Some(attr.value) }
-                          "v" => { value = Some(attr.value) }
-                          _ => { if key.is_some() && value.is_some() { break; } }
-                        }
-                      }
-                      relation.tags.push(Tag { key: key.unwrap(), value: value.unwrap() });
-                      // Make sure to close <way /> off
-                      ensure_element_closure(parser, position);
-                    }
-
-                    &_ => {
-                      // Invalid tag in relation
-                      // TODO error handling
-                      panic!();
-                    }
-                  }
-                }
-
-                _ => { /* TODO error */ }
-              }
-            }
-          }
+          "node"      => { return Some(parse_node      (parser, attributes).into()); }
+          "way"       => { return Some(parse_way       (parser, attributes).into()); }
+          "relation"  => { return Some(parse_relation  (parser, attributes).into()); }
 
           _ => {}
         }
@@ -315,3 +125,201 @@ pub fn read<T: Read>(r: T) /*-> Iterator<Item = Element>*/ {
   }
 }
 
+/// Advances an iterator until a XmlEvent::EndElement is consumed, skipping any whitespace, comments and ProcessingInstruction's.
+/// It returns an error if any other kind of XmlEvent is encountered.
+fn expect_end_element<T: Read>(parser: &mut EventReader<T>) -> Option<Result<Element, Error>> {
+  loop { // loop until either unexpected thing or closing tag is encountered.
+    match parser.next().unwrap() {
+      Ok(XmlEvent::EndElement { .. })             => { break; }
+      Ok(XmlEvent::Comment { .. })                => {} // Ignore
+      Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
+      Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
+
+      // Don't think this is possible, considering it should throw an EOF error from the parser.
+      Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
+
+      Ok(XmlEvent::Characters { .. })             => { return Some(Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(parser.position()))));       }
+      Ok(XmlEvent::CData { .. })                  => { return Some(Err(Error::UnexpectedCData(       ErrorPosition::Rough(parser.position()))));       }
+      Ok(XmlEvent::StartElement { name, .. })     => { return Some(Err(Error::UnexpectedElement { position: ErrorPosition::Rough(parser.position()), expected: None, got: name.local_name }));       }
+      Err(err)                                    => { return Some(Err(Error::ParserError(           ErrorPosition::Rough(parser.position()), err)));  }
+    }
+  }
+}
+
+fn parse_node<T>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) -> Result<Node, Error> {
+  let meta = metadata(attributes.iter()).unwrap();
+
+  let mut lat: Option<f64> = None;
+  let mut lon: Option<f64> = None;
+
+
+  for attr in attributes.iter() {
+    let name = &(attr.name.local_name);
+    let value = &attr.value;
+
+    match name.as_str() {
+      "lat"       => { lat = Some(value.parse::<f64>().unwrap()); }
+      "lon"       => { lon = Some(value.parse::<f64>().unwrap()); }
+      _ => {}
+    }
+  }
+
+  if let None = lat { return Err(Error::MissingAttribute(ErrorPosition::Rough(parser.position()), "lat")); }
+  if let None = lon { return Err(Error::MissingAttribute(ErrorPosition::Rough(parser.position()), "lon")); }
+
+  expect_end_element(parser)?;
+  return Ok(Some(Element::Node(
+    Node {
+      lat: lat.unwrap(),
+      lon: lon.unwrap(),
+      tags: Vec::new(),
+      metadata: meta,
+    }
+  )));
+}
+
+fn parse_way<T>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) -> Result<Way, Error> {
+  let mut way = Way {
+    metadata: metadata(attributes.iter()).unwrap(),
+    tags: Vec::new(),
+    nodes: Vec::new()
+  };
+
+  loop { // Read all node references and tags
+    match parser.next().unwrap() { // Can't have an empty way anyway..
+      Ok(XmlEvent::StartElement { name, attributes, .. }) => {
+        match name.local_name.as_str() {
+          "nd" => {
+            way.nodes.push(
+              ReferencedNode {
+                id: attributes.iter()
+                .find(|attr| attr.name.local_name == "ref").unwrap()
+                .value.parse::<i64>().unwrap()
+              }
+            );
+
+            // Make sure to read EndElement for <nd ref=".." />
+            expect_end_element(parser)?;
+          }
+
+          "tag" => {
+            let mut key: Option<String> = None;
+            let mut value: Option<String> = None;
+            for attr in attributes { // TODO optimize
+              match attr.name.local_name.as_str() {
+                "k" => { key = Some(attr.value); }
+                "v" => { value = Some(attr.value); }
+                _ => {} // Can be safely ignored
+              }
+            }
+            way.tags.push(Tag { key: key.unwrap(), value: value.unwrap() });
+
+            // Make sure to read EndElement for <tag />
+            expect_end_element(parser)?;
+
+          }
+          _ => { return Err(Error::UnexpectedElement { position: ErrorPosition::Rough(parser.position()), expected: None, got: name.local_name }); }
+        }
+      }
+
+      Ok(XmlEvent::EndElement { .. }) => { break; } // Encountered </way>, exit from node & tag reading loop
+
+      Ok(XmlEvent::Comment { .. })                => {} // Ignore
+      Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
+      Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
+
+      // Don't think this is possible, considering it should throw an EOF error from the parser.
+      Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
+
+      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(parser.position())));       }
+      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       ErrorPosition::Rough(parser.position())));       }
+      Err(err)                                    => { return Err(Error::ParserError(           ErrorPosition::Rough(parser.position()), err));  }
+    }
+  }
+
+  return Ok(way);
+}
+
+fn parse_relation<T>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) -> Result<Relation, Error> {
+  let mut relation = Relation {
+    metadata: metadata(attributes.iter()).unwrap(),
+    members: Vec::new(),
+    tags: Vec::new(),
+  };
+
+  loop { // Loop reading all members, tags etc
+    match parser.next().unwrap() {
+      Ok(XmlEvent::StartElement { name, attributes, .. }) => {
+        match name.local_name.as_str() {
+          "member" => {
+            let mut kind_maybe: Option<String> = None;
+            let mut ref_id_maybe: Option<i64> = None;
+            let mut role_maybe: Option<String> = None;
+
+            for attr in attributes.into_iter() {
+              match attr.name.local_name.as_str() {
+                "type" => { kind_maybe = Some(attr.value); }
+                "ref" => { ref_id_maybe = Some(attr.value.parse::<i64>().unwrap()); }
+                "role" => { role_maybe = Some(attr.value); }
+                _ => {}
+              }
+            }
+
+            let kind    = if let Some(kind)   = kind_maybe    { kind }    else { return Err(Error::MissingRelationMemberType(ErrorPosition::Rough(parser.position()))); };
+            let ref_id  = if let Some(ref_id) = ref_id_maybe  { ref_id }  else { return Err(Error::MissingRelationMemberRef(ErrorPosition::Rough(parser.position()))); };
+            let role    = if let Some(role)   = role_maybe    { role }    else { return Err(Error::MissingRelationMemberRole(ErrorPosition::Rough(parser.position()))); };
+
+            let element = match kind.as_str() {
+              "node"      => ReferencedElement::Node(ref_id),
+              "way"       => ReferencedElement::Way(ref_id),
+              "relation"  => ReferencedElement::Relation(ref_id),
+              other => { return Err(Error::InvalidRelationMemberType(ErrorPosition::Rough(parser.position()), kind)); }
+            };
+
+            relation.members.push(RelationMember {
+              role: role,
+              element: element,
+            });
+
+            // Make sure to close <member /> off
+            expect_end_element(parser)?;
+          }
+
+          "tag" => {
+            let mut key: Option<String> = None;
+            let mut value: Option<String> = None;
+            for attr in attributes.into_iter() {
+              match attr.name.local_name.as_str() {
+                "k" => { key = Some(attr.value) }
+                "v" => { value = Some(attr.value) }
+                _ => { if key.is_some() && value.is_some() { break; } }
+              }
+            }
+            relation.tags.push(Tag { key: key.unwrap(), value: value.unwrap() });
+            // Make sure to close <way /> off
+            expect_end_element(parser)?;
+          }
+
+          &_ => { /* ignore unrecognized element within <relation>...</relation>*/ }
+        }
+      }
+
+
+      Ok(XmlEvent::Comment { .. })                => {} // Ignore
+      Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
+      Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
+
+      // Don't think this is possible, considering it should throw an EOF error from the parser.
+      Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
+
+      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(parser.position())));       }
+      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       ErrorPosition::Rough(parser.position())));       }
+      Err(err)                                    => { return Err(Error::ParserError(           ErrorPosition::Rough(parser.position()), err));  }
+
+      // Encountered </relation> end element
+      Ok(XmlEvent::EndElement { .. })             => { break; }
+    }
+  }
+
+  return Ok(relation);
+}
