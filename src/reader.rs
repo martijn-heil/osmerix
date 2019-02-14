@@ -6,8 +6,7 @@ use xml::common::Position;
 
 use osm_primitives::*;
 
-// TODO proper error handling with our custom Error type
-fn metadata<'a, T>(attributes: T) -> Result<ElementMetadata, std::option::NoneError> where T: Iterator<Item = &'a OwnedAttribute> {
+fn metadata<'a, T>(attributes: T) -> Result<ElementMetadata, Error> where T: Iterator<Item = &'a OwnedAttribute> {
   let mut id: Option<i64> = None;
   let mut user: Option<String> = None;
   let mut uid: Option<u64> = None;
@@ -31,12 +30,12 @@ fn metadata<'a, T>(attributes: T) -> Result<ElementMetadata, std::option::NoneEr
   }
 
   Ok(ElementMetadata {
-    id: id?,
-    user: user?,
-    uid: uid?,
-    version: version?,
-    changeset: changeset?,
-    timestamp: timestamp?
+    id: id.unwrap(),
+    user: user.unwrap(),
+    uid: uid.unwrap(),
+    version: version.unwrap(),
+    changeset: changeset.unwrap(),
+    timestamp: timestamp.unwrap() // TODO proper error handling
   })
 }
 
@@ -64,6 +63,7 @@ pub enum ErrorPosition {
   Rough(TextPosition),
 }
 
+#[derive(Debug)]
 pub enum Error {
   MissingRelationMemberType(ErrorPosition),
   MissingRelationMemberRole(ErrorPosition),
@@ -73,7 +73,9 @@ pub enum Error {
   ParserError(ErrorPosition, xml::reader::Error),
   UnexpectedCData(ErrorPosition),
   UnexpectedCharacters(ErrorPosition),
-  InvalidRelationMemberType(ErrorPosition, String)
+  UnexpectedEndElement(ErrorPosition),
+  InvalidRelationMemberType(ErrorPosition, String),
+  OsmNotFound(),
 }
 
 struct ReaderIterator<T: Read>(EventReader<T>);
@@ -84,53 +86,86 @@ struct ReaderIterator<T: Read>(EventReader<T>);
 /// 1. All nodes
 /// 2. All ways
 /// 3. All relations
+///
+/// However, if the file doesn't have them in proper order, you won't receive them in proper order either.
 pub struct Reader<T: Read> {
   parser: EventReader<T>,
-  metadata: Option<DocumentMetadata>,
+  pub metadata: DocumentMetadata,
 }
 
-impl<T: Read> Reader<T> {
-  fn new(r: T) -> Self {
-    Reader {
-      parser: EventReader::new(r),
-    }
-  }
-
-  fn metadata(&mut self) -> DocumentMetadata {
-
-  }
-}
-
-impl<T: Read> Iterator<Item = Result<Element, Error>> for Reader<T> {
-  fn next(&mut self) -> Option<Self::Item> {
-    let parser = &mut self.parser;
-
+fn get_document_metadata<T: Read>(parser: &mut EventReader<T>) -> Result<DocumentMetadata, Error> {
+  loop {
     let next = parser.next();
-    if next.is_none() { return Ok(None); } // Last element has already been served, we are now at the end.
-    // TODO handle closing osm element
-
+    if next.is_none() { return Err(Error::EmptyDocument()); }
     match next.unwrap() {
       Ok(XmlEvent::StartElement { name, attributes, .. }) => {
-        match name.local_name.as_str() {
-          "node"      => { return Some(parse_node      (parser, attributes).into()); }
-          "way"       => { return Some(parse_way       (parser, attributes).into()); }
-          "relation"  => { return Some(parse_relation  (parser, attributes).into()); }
+        if let XmlEvent::StartElement { name, attributes, ..} = name.local_name.as_str() {
+          if name.local_name == "osm" {
+            let mut metadata = DocumentMetadata {
+              generator: None,
+              version: None,
+            };
 
-          _ => {}
+            for attr in attributes.iter() {
+              match attr.name.local_name.as_str() => {
+                "generator" => { metadata.generator = Some(attr.value); }
+                "version" => { metadata.version = Some(attr.value); }
+                _ => {}
+              }
+            }
+            return Ok(metadata);
+          }
+        } else {
+          return Err(Error::UnexpectedElement { position: ErrorPosition::Rough(parser.position()), expected: Some(vec![String::from("osm")]), got: name.local_name });
         }
       }
 
-      _ => { panic!(); /* TODO error */ }
+      Ok(XmlEvent::EndElement { .. })             => { return Err(Error::UnexpectedEndElement(ErrorPosition::Rough(parser.position()))); }
+      Ok(XmlEvent::Comment { .. })                => {} // Ignore
+      Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
+      Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
+
+      Ok(XmlEvent::EndDocument { .. })            => { return Err(Error::OsmNotFound());                                                        }
+      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(parser.position())));      }
+      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       ErrorPosition::Rough(parser.position())));      }
+      Err(err)                                    => { return Err(Error::ParserError(           ErrorPosition::Rough(parser.position()), err)); }
     }
   }
 }
 
-/// Advances an iterator until a XmlEvent::EndElement is consumed, skipping any whitespace, comments and ProcessingInstruction's.
-/// It returns an error if any other kind of XmlEvent is encountered.
-fn expect_end_element<T: Read>(parser: &mut EventReader<T>) -> Option<Result<Element, Error>> {
-  loop { // loop until either unexpected thing or closing tag is encountered.
-    match parser.next().unwrap() {
-      Ok(XmlEvent::EndElement { .. })             => { break; }
+impl<T: Read> Reader<T> {
+  pub fn new(r: T) -> Result<Self, Error> {
+    let parser = EventReader::new(r);
+
+    Ok(Reader {
+      parser: parser,
+      metadata = get_document_metadata(&mut parser)?,
+    })
+  }
+}
+
+impl<T: Read> Iterator for Reader<T> {
+  type Item = Result<Element, Error>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    let parser = &mut self.parser;
+
+    loop {
+      let next = parser.next();
+      // TODO handle closing osm element
+
+      match next {
+        Ok(XmlEvent::StartElement { name, attributes, .. }) => {
+          match name.local_name.as_str() {
+            "node"      => { return Some(parse_node      (parser, attributes).map(|okval| okval.into())); }
+            "way"       => { return Some(parse_way       (parser, attributes).map(|okval| okval.into())); }
+            "relation"  => { return Some(parse_relation  (parser, attributes).map(|okval| okval.into())); }
+
+            _ => {}
+          }
+        }
+
+      Ok(XmlEvent::EndElement { .. })             => { return Some(Err(Error::UnexpectedEndElement(ErrorPosition::Rough(parser.position())))); }
       Ok(XmlEvent::Comment { .. })                => {} // Ignore
       Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
       Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
@@ -140,13 +175,34 @@ fn expect_end_element<T: Read>(parser: &mut EventReader<T>) -> Option<Result<Ele
 
       Ok(XmlEvent::Characters { .. })             => { return Some(Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(parser.position()))));       }
       Ok(XmlEvent::CData { .. })                  => { return Some(Err(Error::UnexpectedCData(       ErrorPosition::Rough(parser.position()))));       }
-      Ok(XmlEvent::StartElement { name, .. })     => { return Some(Err(Error::UnexpectedElement { position: ErrorPosition::Rough(parser.position()), expected: None, got: name.local_name }));       }
       Err(err)                                    => { return Some(Err(Error::ParserError(           ErrorPosition::Rough(parser.position()), err)));  }
+      } // end match
+    } // end loop
+  }
+}
+
+/// Advances an iterator until a XmlEvent::EndElement is consumed, skipping any whitespace, comments and ProcessingInstruction's.
+/// It returns an error if any other kind of XmlEvent is encountered.
+fn expect_end_element<T: Read>(parser: &mut EventReader<T>) -> Result<(), Error> {
+  loop { // loop until either unexpected thing or closing tag is encountered.
+    match parser.next() {
+      Ok(XmlEvent::EndElement { .. })             => { return Ok(()); }
+      Ok(XmlEvent::Comment { .. })                => {} // Ignore
+      Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
+      Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
+
+      // Don't think this is possible, considering it should throw an EOF error from the parser.
+      Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
+
+      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(parser.position())));       }
+      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       ErrorPosition::Rough(parser.position())));       }
+      Ok(XmlEvent::StartElement { name, .. })     => { return Err(Error::UnexpectedElement { position: ErrorPosition::Rough(parser.position()), expected: None, got: name.local_name });       }
+      Err(err)                                    => { return Err(Error::ParserError(           ErrorPosition::Rough(parser.position()), err));  }
     }
   }
 }
 
-fn parse_node<T>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) -> Result<Node, Error> {
+fn parse_node<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) -> Result<Node, Error> {
   let meta = metadata(attributes.iter()).unwrap();
 
   let mut lat: Option<f64> = None;
@@ -168,17 +224,17 @@ fn parse_node<T>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) -
   if let None = lon { return Err(Error::MissingAttribute(ErrorPosition::Rough(parser.position()), "lon")); }
 
   expect_end_element(parser)?;
-  return Ok(Some(Element::Node(
+  return Ok(
     Node {
       lat: lat.unwrap(),
       lon: lon.unwrap(),
       tags: Vec::new(),
       metadata: meta,
     }
-  )));
+  );
 }
 
-fn parse_way<T>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) -> Result<Way, Error> {
+fn parse_way<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) -> Result<Way, Error> {
   let mut way = Way {
     metadata: metadata(attributes.iter()).unwrap(),
     tags: Vec::new(),
@@ -186,7 +242,7 @@ fn parse_way<T>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) ->
   };
 
   loop { // Read all node references and tags
-    match parser.next().unwrap() { // Can't have an empty way anyway..
+    match parser.next() { // Can't have an empty way anyway..
       Ok(XmlEvent::StartElement { name, attributes, .. }) => {
         match name.local_name.as_str() {
           "nd" => {
@@ -240,7 +296,7 @@ fn parse_way<T>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) ->
   return Ok(way);
 }
 
-fn parse_relation<T>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) -> Result<Relation, Error> {
+fn parse_relation<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) -> Result<Relation, Error> {
   let mut relation = Relation {
     metadata: metadata(attributes.iter()).unwrap(),
     members: Vec::new(),
@@ -248,7 +304,7 @@ fn parse_relation<T>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute
   };
 
   loop { // Loop reading all members, tags etc
-    match parser.next().unwrap() {
+    match parser.next() {
       Ok(XmlEvent::StartElement { name, attributes, .. }) => {
         match name.local_name.as_str() {
           "member" => {
