@@ -56,11 +56,12 @@ pub enum Error {
   MissingAttribute(TextPosition, &'static str),
   UnexpectedElement { position: TextPosition, expected: Option<Vec<String>>, got: String },
   ParserError(TextPosition, xml::reader::Error),
-  UnexpectedCData(Textposition),
+  UnexpectedCData(TextPosition),
   UnexpectedCharacters(TextPosition),
   UnexpectedEndElement(TextPosition),
   InvalidRelationMemberType(TextPosition, String),
   OsmElementNotFound(),
+  UnexpectedStartDocument(TextPosition),
 }
 
 struct ReaderIterator<T: Read>(EventReader<T>);
@@ -91,8 +92,8 @@ fn get_document_metadata<T: Read>(parser: &mut EventReader<T>) -> Result<Documen
 
           for attr in attributes.iter() {
             match attr.name.local_name.as_str() {
-              "generator" => { metadata.generator = Some(attr.value); }
-              "version" => { metadata.version = Some(attr.value); }
+              "generator" => { metadata.generator = Some(attr.value.to_owned()); }
+              "version" => { metadata.version = Some(attr.value.to_owned()); }
               _ => {}
             }
           }
@@ -118,11 +119,11 @@ fn get_document_metadata<T: Read>(parser: &mut EventReader<T>) -> Result<Documen
 
 impl<T: Read> Reader<T> {
   pub fn new(r: T) -> Result<Self, Error> {
-    let parser = EventReader::new(r);
+    let mut parser = EventReader::new(r);
 
     Ok(Reader {
-      parser: parser,
       metadata: get_document_metadata(&mut parser)?,
+      parser: parser,
     })
   }
 }
@@ -157,7 +158,7 @@ impl<T: Read> Iterator for Reader<T> {
       // Don't think this is possible, considering it should throw an EOF error from the parser.
       Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
 
-      Ok(XmlEvent::Characters { .. })             => { return Some(Err(Error::UnexpectedCharacters(parser.position())); }
+      Ok(XmlEvent::Characters { .. })             => { return Some(Err(Error::UnexpectedCharacters(parser.position()))); }
       Ok(XmlEvent::CData { .. })                  => { return Some(Err(Error::UnexpectedCData(parser.position())));     }
       Err(err)                                    => { return Some(Err(Error::ParserError(parser.position(), err)));    }
       } // end match
@@ -181,6 +182,7 @@ fn expect_end_element<T: Read>(parser: &mut EventReader<T>) -> Result<(), Error>
       Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(parser.position())); }
       Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(parser.position())); }
       Ok(XmlEvent::StartElement { name, .. })     => { return Err(Error::UnexpectedElement { position: parser.position(), expected: None, got: name.local_name }); }
+      Ok(XmlEvent::StartDocument { .. })          => { return Err(Error::UnexpectedStartDocument(parser.position())); }
       Err(err)                                    => { return Err(Error::ParserError(parser.position(), err)); }
     }
   }
@@ -271,9 +273,10 @@ fn parse_way<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribut
       // Don't think this is possible, considering it should throw an EOF error from the parser.
       Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
 
+      Ok(XmlEvent::StartDocument { .. })          => { return Err(Error::UnexpectedStartDocument(parser.position())); }
       Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(parser.position())); }
       Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(parser.position())); }
-      Err(err)                                    => { return Err(Error::ParserError(parser.position()), err); }
+      Err(err)                                    => { return Err(Error::ParserError(parser.position(), err)); }
     }
   }
 
@@ -313,7 +316,7 @@ fn parse_relation<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAtt
               "node"      => ReferencedElement::Node(ref_id),
               "way"       => ReferencedElement::Way(ref_id),
               "relation"  => ReferencedElement::Relation(ref_id),
-              other => { return Err(Error::InvalidRelationMemberType(parser.position(), kind)); }
+              _other => { return Err(Error::InvalidRelationMemberType(parser.position(), kind)); }
             };
 
             relation.members.push(RelationMember {
@@ -351,6 +354,7 @@ fn parse_relation<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAtt
 
       // Don't think this is possible, considering it should throw an EOF error from the parser.
       Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
+      Ok(XmlEvent::StartDocument { .. })          => { return Err(Error::UnexpectedStartDocument(parser.position())); }
 
       Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  parser.position()));       }
       Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       parser.position()));       }
