@@ -48,34 +48,19 @@ pub struct DocumentMetadata {
 /// guaranteed to have (at least) the following two members: `row: u64` and `column: u64`.
 type TextPosition = xml::common::TextPosition;
 
-/// The relevance area or position of an error
-pub enum ErrorPosition {
-  /// Guaranteed exact first and last position of error relevance.
-  Exact {
-    /// Inclusive position of the character where the error relevance begins.
-    first_char: TextPosition,
-
-    /// Inclusive position of the character where the error relevance ends.
-    last_char: TextPosition,
-  },
-
-  /// Best-effort position of error, not guaranteed to have any kind of accuracy.
-  Rough(TextPosition),
-}
-
 #[derive(Debug)]
 pub enum Error {
-  MissingRelationMemberType(ErrorPosition),
-  MissingRelationMemberRole(ErrorPosition),
-  MissingRelationMemberRef(ErrorPosition),
-  MissingAttribute(ErrorPosition, &'static str),
-  UnexpectedElement { position: ErrorPosition, expected: Option<Vec<String>>, got: String },
-  ParserError(ErrorPosition, xml::reader::Error),
-  UnexpectedCData(ErrorPosition),
-  UnexpectedCharacters(ErrorPosition),
-  UnexpectedEndElement(ErrorPosition),
-  InvalidRelationMemberType(ErrorPosition, String),
-  OsmNotFound(),
+  MissingRelationMemberType(TextPosition),
+  MissingRelationMemberRole(TextPosition),
+  MissingRelationMemberRef(TextPosition),
+  MissingAttribute(TextPosition, &'static str),
+  UnexpectedElement { position: TextPosition, expected: Option<Vec<String>>, got: String },
+  ParserError(TextPosition, xml::reader::Error),
+  UnexpectedCData(Textposition),
+  UnexpectedCharacters(TextPosition),
+  UnexpectedEndElement(TextPosition),
+  InvalidRelationMemberType(TextPosition, String),
+  OsmElementNotFound(),
 }
 
 struct ReaderIterator<T: Read>(EventReader<T>);
@@ -96,39 +81,37 @@ pub struct Reader<T: Read> {
 fn get_document_metadata<T: Read>(parser: &mut EventReader<T>) -> Result<DocumentMetadata, Error> {
   loop {
     let next = parser.next();
-    if next.is_none() { return Err(Error::EmptyDocument()); }
-    match next.unwrap() {
+    match next {
       Ok(XmlEvent::StartElement { name, attributes, .. }) => {
-        if let XmlEvent::StartElement { name, attributes, ..} = name.local_name.as_str() {
-          if name.local_name == "osm" {
-            let mut metadata = DocumentMetadata {
-              generator: None,
-              version: None,
-            };
+        if name.local_name == "osm" {
+          let mut metadata = DocumentMetadata {
+            generator: None,
+            version: None,
+          };
 
-            for attr in attributes.iter() {
-              match attr.name.local_name.as_str() => {
-                "generator" => { metadata.generator = Some(attr.value); }
-                "version" => { metadata.version = Some(attr.value); }
-                _ => {}
-              }
+          for attr in attributes.iter() {
+            match attr.name.local_name.as_str() {
+              "generator" => { metadata.generator = Some(attr.value); }
+              "version" => { metadata.version = Some(attr.value); }
+              _ => {}
             }
-            return Ok(metadata);
           }
+          return Ok(metadata);
         } else {
-          return Err(Error::UnexpectedElement { position: ErrorPosition::Rough(parser.position()), expected: Some(vec![String::from("osm")]), got: name.local_name });
+          return Err(Error::UnexpectedElement { position: parser.position(), expected: Some(vec![String::from("osm")]), got: name.local_name });
         }
       }
 
-      Ok(XmlEvent::EndElement { .. })             => { return Err(Error::UnexpectedEndElement(ErrorPosition::Rough(parser.position()))); }
+      Ok(XmlEvent::EndElement { .. })             => { return Err(Error::UnexpectedEndElement(parser.position())); }
       Ok(XmlEvent::Comment { .. })                => {} // Ignore
       Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
       Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
+      Ok(XmlEvent::StartDocument { .. })          => {} // Ignore.. for now TODO maybe we should make sure that we only receive this the first time and only once?
 
-      Ok(XmlEvent::EndDocument { .. })            => { return Err(Error::OsmNotFound());                                                        }
-      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(parser.position())));      }
-      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       ErrorPosition::Rough(parser.position())));      }
-      Err(err)                                    => { return Err(Error::ParserError(           ErrorPosition::Rough(parser.position()), err)); }
+      Ok(XmlEvent::EndDocument { .. })            => { return Err(Error::OsmElementNotFound());                                                        }
+      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  parser.position()));      }
+      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       parser.position()));      }
+      Err(err)                                    => { return Err(Error::ParserError(           parser.position(), err)); }
     }
   }
 }
@@ -139,7 +122,7 @@ impl<T: Read> Reader<T> {
 
     Ok(Reader {
       parser: parser,
-      metadata = get_document_metadata(&mut parser)?,
+      metadata: get_document_metadata(&mut parser)?,
     })
   }
 }
@@ -165,7 +148,8 @@ impl<T: Read> Iterator for Reader<T> {
           }
         }
 
-      Ok(XmlEvent::EndElement { .. })             => { return Some(Err(Error::UnexpectedEndElement(ErrorPosition::Rough(parser.position())))); }
+      Ok(XmlEvent::EndElement { .. })             => { return Some(Err(Error::UnexpectedEndElement(parser.position()))); }
+      Ok(XmlEvent::StartDocument { .. })          => { return Some(Err(Error::UnexpectedStartDocument(parser.position()))); }
       Ok(XmlEvent::Comment { .. })                => {} // Ignore
       Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
       Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
@@ -173,9 +157,9 @@ impl<T: Read> Iterator for Reader<T> {
       // Don't think this is possible, considering it should throw an EOF error from the parser.
       Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
 
-      Ok(XmlEvent::Characters { .. })             => { return Some(Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(parser.position()))));       }
-      Ok(XmlEvent::CData { .. })                  => { return Some(Err(Error::UnexpectedCData(       ErrorPosition::Rough(parser.position()))));       }
-      Err(err)                                    => { return Some(Err(Error::ParserError(           ErrorPosition::Rough(parser.position()), err)));  }
+      Ok(XmlEvent::Characters { .. })             => { return Some(Err(Error::UnexpectedCharacters(parser.position())); }
+      Ok(XmlEvent::CData { .. })                  => { return Some(Err(Error::UnexpectedCData(parser.position())));     }
+      Err(err)                                    => { return Some(Err(Error::ParserError(parser.position(), err)));    }
       } // end match
     } // end loop
   }
@@ -194,10 +178,10 @@ fn expect_end_element<T: Read>(parser: &mut EventReader<T>) -> Result<(), Error>
       // Don't think this is possible, considering it should throw an EOF error from the parser.
       Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
 
-      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(parser.position())));       }
-      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       ErrorPosition::Rough(parser.position())));       }
-      Ok(XmlEvent::StartElement { name, .. })     => { return Err(Error::UnexpectedElement { position: ErrorPosition::Rough(parser.position()), expected: None, got: name.local_name });       }
-      Err(err)                                    => { return Err(Error::ParserError(           ErrorPosition::Rough(parser.position()), err));  }
+      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(parser.position())); }
+      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(parser.position())); }
+      Ok(XmlEvent::StartElement { name, .. })     => { return Err(Error::UnexpectedElement { position: parser.position(), expected: None, got: name.local_name }); }
+      Err(err)                                    => { return Err(Error::ParserError(parser.position(), err)); }
     }
   }
 }
@@ -220,8 +204,8 @@ fn parse_node<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribu
     }
   }
 
-  if let None = lat { return Err(Error::MissingAttribute(ErrorPosition::Rough(parser.position()), "lat")); }
-  if let None = lon { return Err(Error::MissingAttribute(ErrorPosition::Rough(parser.position()), "lon")); }
+  if let None = lat { return Err(Error::MissingAttribute(parser.position(), "lat")); }
+  if let None = lon { return Err(Error::MissingAttribute(parser.position(), "lon")); }
 
   expect_end_element(parser)?;
   return Ok(
@@ -274,7 +258,7 @@ fn parse_way<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribut
             expect_end_element(parser)?;
 
           }
-          _ => { return Err(Error::UnexpectedElement { position: ErrorPosition::Rough(parser.position()), expected: None, got: name.local_name }); }
+          _ => { return Err(Error::UnexpectedElement { position: parser.position(), expected: None, got: name.local_name }); }
         }
       }
 
@@ -287,9 +271,9 @@ fn parse_way<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribut
       // Don't think this is possible, considering it should throw an EOF error from the parser.
       Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
 
-      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(parser.position())));       }
-      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       ErrorPosition::Rough(parser.position())));       }
-      Err(err)                                    => { return Err(Error::ParserError(           ErrorPosition::Rough(parser.position()), err));  }
+      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(parser.position())); }
+      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(parser.position())); }
+      Err(err)                                    => { return Err(Error::ParserError(parser.position()), err); }
     }
   }
 
@@ -321,15 +305,15 @@ fn parse_relation<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAtt
               }
             }
 
-            let kind    = if let Some(kind)   = kind_maybe    { kind }    else { return Err(Error::MissingRelationMemberType(ErrorPosition::Rough(parser.position()))); };
-            let ref_id  = if let Some(ref_id) = ref_id_maybe  { ref_id }  else { return Err(Error::MissingRelationMemberRef(ErrorPosition::Rough(parser.position()))); };
-            let role    = if let Some(role)   = role_maybe    { role }    else { return Err(Error::MissingRelationMemberRole(ErrorPosition::Rough(parser.position()))); };
+            let kind    = if let Some(kind)   = kind_maybe    { kind }    else { return Err(Error::MissingRelationMemberType(parser.position())); };
+            let ref_id  = if let Some(ref_id) = ref_id_maybe  { ref_id }  else { return Err(Error::MissingRelationMemberRef(parser.position()));  };
+            let role    = if let Some(role)   = role_maybe    { role }    else { return Err(Error::MissingRelationMemberRole(parser.position())); };
 
             let element = match kind.as_str() {
               "node"      => ReferencedElement::Node(ref_id),
               "way"       => ReferencedElement::Way(ref_id),
               "relation"  => ReferencedElement::Relation(ref_id),
-              other => { return Err(Error::InvalidRelationMemberType(ErrorPosition::Rough(parser.position()), kind)); }
+              other => { return Err(Error::InvalidRelationMemberType(parser.position(), kind)); }
             };
 
             relation.members.push(RelationMember {
@@ -368,9 +352,9 @@ fn parse_relation<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAtt
       // Don't think this is possible, considering it should throw an EOF error from the parser.
       Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
 
-      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  ErrorPosition::Rough(parser.position())));       }
-      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       ErrorPosition::Rough(parser.position())));       }
-      Err(err)                                    => { return Err(Error::ParserError(           ErrorPosition::Rough(parser.position()), err));  }
+      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(  parser.position()));       }
+      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(       parser.position()));       }
+      Err(err)                                    => { return Err(Error::ParserError(           parser.position(), err));  }
 
       // Encountered </relation> end element
       Ok(XmlEvent::EndElement { .. })             => { break; }
