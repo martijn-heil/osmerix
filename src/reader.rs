@@ -40,8 +40,8 @@ fn metadata<'a, T>(attributes: T) -> Result<ElementMetadata, Error> where T: Ite
 }
 
 pub struct DocumentMetadata {
-  version: Option<String>,
-  generator: Option<String>,
+  pub version: Option<String>,
+  pub generator: Option<String>,
 }
 
 /// Type definition may change over time, but unless a breaking change is made the struct is always
@@ -63,8 +63,6 @@ pub enum Error {
   OsmElementNotFound(),
   UnexpectedStartDocument(TextPosition),
 }
-
-struct ReaderIterator<T: Read>(EventReader<T>);
 
 /// Non-validating [OSM XML](https://wiki.openstreetmap.org/wiki/OSM_XML) parser.
 ///
@@ -145,11 +143,21 @@ impl<T: Read> Iterator for Reader<T> {
             "way"       => { return Some(parse_way       (parser, attributes).map(|okval| okval.into())); }
             "relation"  => { return Some(parse_relation  (parser, attributes).map(|okval| okval.into())); }
 
-            _ => {}
+            _ => {
+              match expect_end_element(parser) {
+                Err(err) => { return Some(Err(err)); }
+                _ => {}
+              }
+            }
           }
         }
 
-      Ok(XmlEvent::EndElement { .. })             => { return Some(Err(Error::UnexpectedEndElement(parser.position()))); }
+      Ok(XmlEvent::EndElement { name, .. }) => {
+        match name.local_name.as_str() {
+          "osm" => { return None; }
+          _ => { return Some(Err(Error::UnexpectedEndElement(parser.position()))); }
+        }
+      }
       Ok(XmlEvent::StartDocument { .. })          => { return Some(Err(Error::UnexpectedStartDocument(parser.position()))); }
       Ok(XmlEvent::Comment { .. })                => {} // Ignore
       Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
@@ -209,15 +217,54 @@ fn parse_node<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribu
   if let None = lat { return Err(Error::MissingAttribute(parser.position(), "lat")); }
   if let None = lon { return Err(Error::MissingAttribute(parser.position(), "lon")); }
 
-  expect_end_element(parser)?;
-  return Ok(
-    Node {
-      lat: lat.unwrap(),
-      lon: lon.unwrap(),
-      tags: Vec::new(),
-      metadata: meta,
+  let mut node = Node {
+    lat: lat.unwrap(),
+    lon: lon.unwrap(),
+    tags: Vec::new(),
+    metadata: meta,
+  };
+
+  loop { // Read all tags
+    match parser.next() {
+      Ok(XmlEvent::StartElement { name, attributes, .. }) => {
+        match name.local_name.as_str() {
+          "tag" => {
+            let mut key: Option<String> = None;
+            let mut value: Option<String> = None;
+            for attr in attributes { // TODO optimize
+              match attr.name.local_name.as_str() {
+                "k" => { key = Some(attr.value); }
+                "v" => { value = Some(attr.value); }
+                _ => {} // Can be safely ignored
+              }
+            }
+            node.tags.push(Tag { key: key.unwrap(), value: value.unwrap() });
+
+            // Make sure to read EndElement for <tag />
+            expect_end_element(parser)?;
+
+          }
+          // TODO be able to ignore unrecognized elements?
+          _ => { return Err(Error::UnexpectedElement { position: parser.position(), expected: None, got: name.local_name }); }
+        }
+      }
+
+      Ok(XmlEvent::EndElement { .. })             => { break; } // End of node
+      Ok(XmlEvent::Comment { .. })                => {} // Ignore
+      Ok(XmlEvent::Whitespace { .. })             => {} // Ignore
+      Ok(XmlEvent::ProcessingInstruction { .. })  => {} // Ignore
+
+      // Don't think this is possible, considering it should throw an EOF error from the parser.
+      Ok(XmlEvent::EndDocument { .. })            => { panic!("Unexpected XmlEvent::EndDocument, this should not even be possible!"); }
+
+      Ok(XmlEvent::StartDocument { .. })          => { return Err(Error::UnexpectedStartDocument(parser.position())); }
+      Ok(XmlEvent::Characters { .. })             => { return Err(Error::UnexpectedCharacters(parser.position())); }
+      Ok(XmlEvent::CData { .. })                  => { return Err(Error::UnexpectedCData(parser.position())); }
+      Err(err)                                    => { return Err(Error::ParserError(parser.position(), err)); }
     }
-  );
+  }
+
+  Ok(node)
 }
 
 fn parse_way<T: Read>(parser: &mut EventReader<T>, attributes: Vec<OwnedAttribute>) -> Result<Way, Error> {
