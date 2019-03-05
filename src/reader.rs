@@ -6,6 +6,8 @@ use xml::common::Position;
 
 use osm_primitives::*;
 
+use crate::DocumentMetadata;
+
 fn metadata<'a, T>(attributes: T) -> Result<ElementMetadata, Error> where T: Iterator<Item = &'a OwnedAttribute> {
   let mut id: Option<i64> = None;
   let mut user: Option<String> = None;
@@ -39,14 +41,9 @@ fn metadata<'a, T>(attributes: T) -> Result<ElementMetadata, Error> where T: Ite
   })
 }
 
-pub struct DocumentMetadata {
-  pub version: Option<String>,
-  pub generator: Option<String>,
-}
-
 /// Type definition may change over time, but unless a breaking change is made the struct is always
 /// guaranteed to have (at least) the following two members: `row: u64` and `column: u64`.
-type TextPosition = xml::common::TextPosition;
+pub type TextPosition = xml::common::TextPosition;
 
 #[derive(Debug)]
 pub enum Error {
